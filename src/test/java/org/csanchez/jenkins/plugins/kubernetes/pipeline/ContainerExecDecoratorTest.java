@@ -1,0 +1,347 @@
+/*
+ * The MIT License
+ *
+ * Copyright (c) 2016, Carlos Sanchez
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+
+package org.csanchez.jenkins.plugins.kubernetes.pipeline;
+
+import static org.csanchez.jenkins.plugins.kubernetes.KubernetesTestUtil.*;
+import static org.hamcrest.Matchers.*;
+import static org.junit.Assert.*;
+import static org.mockito.Mockito.*;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.regex.Pattern;
+
+import org.apache.commons.io.output.TeeOutputStream;
+import org.apache.commons.lang.RandomStringUtils;
+import org.csanchez.jenkins.plugins.kubernetes.KubernetesClientProvider;
+import org.csanchez.jenkins.plugins.kubernetes.KubernetesCloud;
+import org.csanchez.jenkins.plugins.kubernetes.KubernetesSlave;
+import org.csanchez.jenkins.plugins.kubernetes.PodTemplate;
+import org.jenkinsci.plugins.workflow.steps.StepContext;
+import org.junit.After;
+import org.junit.Before;
+import org.junit.BeforeClass;
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.rules.ExpectedException;
+import org.junit.rules.TestName;
+import org.jvnet.hudson.test.Issue;
+import org.jvnet.hudson.test.LoggerRule;
+
+import hudson.Launcher;
+import hudson.Launcher.DummyLauncher;
+import hudson.Launcher.ProcStarter;
+import hudson.model.Node;
+import hudson.util.StreamTaskListener;
+import io.fabric8.kubernetes.api.model.Container;
+import io.fabric8.kubernetes.api.model.ContainerBuilder;
+import io.fabric8.kubernetes.api.model.Pod;
+import io.fabric8.kubernetes.api.model.PodBuilder;
+import io.fabric8.kubernetes.client.HttpClientAware;
+import io.fabric8.kubernetes.client.KubernetesClient;
+import okhttp3.OkHttpClient;
+
+/**
+ * @author Carlos Sanchez
+ */
+public class ContainerExecDecoratorTest {
+    @Rule
+    public ExpectedException exception = ExpectedException.none();
+
+    private KubernetesCloud cloud;
+    private static KubernetesClient client;
+    private static final Pattern PID_PATTERN = Pattern.compile("^((?:\\[\\d+\\] )?pid is \\d+)$", Pattern.MULTILINE);
+
+    private ContainerExecDecorator decorator;
+    private Pod pod;
+
+    @Rule
+    public LoggerRule containerExecLogs = new LoggerRule()
+            .record(Logger.getLogger(ContainerExecDecorator.class.getName()), Level.ALL) //
+            .record(Logger.getLogger(KubernetesClientProvider.class.getName()), Level.ALL);
+
+    @Rule
+    public TestName name = new TestName();
+
+    @BeforeClass
+    public static void isKubernetesConfigured() throws Exception {
+        assumeKubernetes();
+    }
+
+    @Before
+    public void configureCloud() throws Exception {
+        cloud = setupCloud(this, name);
+        client = cloud.connect();
+        deletePods(client, getLabels(this, name), false);
+
+        String image = "busybox";
+        Container c = new ContainerBuilder().withName(image).withImagePullPolicy("IfNotPresent").withImage(image)
+                .withCommand("cat").withTty(true).build();
+        String podName = "test-command-execution-" + RandomStringUtils.random(5, "bcdfghjklmnpqrstvwxz0123456789");
+        pod = client.pods().create(new PodBuilder().withNewMetadata().withName(podName)
+                .withLabels(getLabels(this, name)).endMetadata().withNewSpec().withContainers(c).endSpec().build());
+
+        System.out.println("Created pod: " + pod.getMetadata().getName());
+
+        PodTemplate template = new PodTemplate();
+        template.setName(pod.getMetadata().getName());
+        KubernetesSlave agent = mock(KubernetesSlave.class);
+        when(agent.getNamespace()).thenReturn(client.getNamespace());
+        when(agent.getPodName()).thenReturn(pod.getMetadata().getName());
+        when(agent.getKubernetesCloud()).thenReturn(cloud);
+        StepContext context = mock(StepContext.class);
+        when(context.get(Node.class)).thenReturn(agent);
+
+        decorator = new ContainerExecDecorator();
+        decorator.setNodeContext(new KubernetesNodeContext(context));
+        decorator.setContainerName(image);
+    }
+
+    @After
+    public void after() throws Exception {
+        client.pods().delete(pod);
+        deletePods(client, getLabels(this, name), true);
+    }
+
+    /**
+     * Test that multiple command execution in parallel works
+     * 
+     * @throws Exception
+     */
+    @Test(timeout = 10000)
+    public void testCommandExecution() throws Exception {
+        Thread[] t = new Thread[10];
+        List<ProcReturn> results = Collections.synchronizedList(new ArrayList<>(t.length));
+        for (int i = 0; i < t.length; i++) {
+            t[i] = newThread(i, results);
+        }
+        for (int i = 0; i < t.length; i++) {
+            t[i].start();
+        }
+        for (int i = 0; i < t.length; i++) {
+            t[i].join();
+        }
+        assertEquals("Not all threads finished successfully", t.length, results.size());
+        for (ProcReturn r : results) {
+            assertTrue("Output should contain pid: " + r.output, PID_PATTERN.matcher(r.output).find());
+            assertEquals(0, r.exitCode);
+            assertFalse(r.proc.isAlive());
+        }
+    }
+
+    private Thread newThread(int i, List<ProcReturn> results) {
+        return new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    command(results, i);
+                } finally {
+                    System.out.println("Thread " + i + " finished");
+                }
+            }
+        }, "test-" + i);
+    }
+
+    private void command(List<ProcReturn> results, int i) {
+        ProcReturn r;
+        try {
+            r = execCommand(false, "sh", "-c", "cd /tmp; echo ["+i+"] pid is $$$$ > test; cat /tmp/test");
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+        results.add(r);
+    }
+
+    @Test
+    public void testCommandExecutionFailure() throws Exception {
+        ProcReturn r = execCommand(false, "false");
+        assertEquals(1, r.exitCode);
+        assertFalse(r.proc.isAlive());
+    }
+
+    @Test
+    public void testCommandExecutionFailureHighError() throws Exception {
+        ProcReturn r = execCommand(false, "sh", "-c", "return 127");
+        assertEquals(127, r.exitCode);
+        assertFalse(r.proc.isAlive());
+    }
+
+    @Test
+    public void testQuietCommandExecution() throws Exception {
+        ProcReturn r = execCommand(true, "echo", "pid is 9999");
+        assertFalse("Output should not contain command: " + r.output, PID_PATTERN.matcher(r.output).find());
+        assertEquals(0, r.exitCode);
+        assertFalse(r.proc.isAlive());
+    }
+
+    @Test
+    public void testCommandExecutionWithNohup() throws Exception {
+        ProcReturn r = execCommand(false, "nohup", "sh", "-c",
+                "sleep 5; cd /tmp; echo pid is $$$$ > test; cat /tmp/test");
+        assertTrue("Output should contain pid: " + r.output, PID_PATTERN.matcher(r.output).find());
+        assertEquals(0, r.exitCode);
+        assertFalse(r.proc.isAlive());
+    }
+
+    @Test
+    public void commandsEscaping() {
+        ProcStarter procStarter = new DummyLauncher(null).launch();
+        procStarter = procStarter.cmds("$$$$", "$$?");
+        String[] commands = ContainerExecDecorator.getCommands(procStarter);
+        assertArrayEquals(new String[] { "\\$\\$", "\\$?" }, commands);
+    }
+
+    @Test
+    public void testCommandExecutionWithEscaping() throws Exception {
+        ProcReturn r = execCommand(false, "sh", "-c", "cd /tmp; false; echo result is $$? > test; cat /tmp/test");
+        assertTrue("Output should contain result: " + r.output,
+                Pattern.compile("^(result is 1)$", Pattern.MULTILINE).matcher(r.output).find());
+        assertEquals(0, r.exitCode);
+        assertFalse(r.proc.isAlive());
+    }
+
+    @Test
+    public void testCommandExecutionWithNohupAndError() throws Exception {
+        ProcReturn r = execCommand(false, "nohup", "sh", "-c", "sleep 5; return 127");
+        assertEquals(127, r.exitCode);
+        assertFalse(r.proc.isAlive());
+    }
+
+    @Test
+    @Issue("JENKINS-46719")
+    public void testContainerDoesNotExist() throws Exception {
+        decorator.setContainerName("doesNotExist");
+        exception.expect(IOException.class);
+        exception.expectMessage(containsString("container [doesNotExist] does not exist in pod ["));
+        execCommand(false, "nohup", "sh", "-c", "sleep 5; return 127");
+    }
+
+    /**
+     * Reproduce JENKINS-55392
+     * 
+     * Caused by: java.util.concurrent.RejectedExecutionException: Task okhttp3.RealCall$AsyncCall@30f55c9f rejected
+     * from java.util.concurrent.ThreadPoolExecutor@25634758[Terminated, pool size = 0, active threads = 0, queued tasks
+     * = 0, completed tasks = 0]
+     * 
+     * @throws Exception
+     */
+    @Test
+    @Issue("JENKINS-55392")
+    public void testRejectedExecutionException() throws Exception {
+        assertTrue(client instanceof HttpClientAware);
+        OkHttpClient httpClient = ((HttpClientAware) client).getHttpClient();
+        System.out.println("Max requests: " + httpClient.dispatcher().getMaxRequests() + "/"
+                + httpClient.dispatcher().getMaxRequestsPerHost());
+        System.out.println("Connection count: " + httpClient.connectionPool().connectionCount() + " - "
+                + httpClient.connectionPool().idleConnectionCount());
+        List<Thread> threads = new ArrayList<>();
+        final AtomicInteger errors = new AtomicInteger(0);
+        for (int i = 0; i < 10; i++) {
+            final String name = "Thread " + i;
+            Thread t = new Thread(new Runnable() {
+                public void run() {
+                    try {
+                        System.out.println(name + " Connection count: " + httpClient.connectionPool().connectionCount()
+                                + " - " + httpClient.connectionPool().idleConnectionCount());
+                        ProcReturn r = execCommand(false, "echo", "test");
+                    } catch (Exception e) {
+                        errors.incrementAndGet();
+                        System.out.println(e.getMessage());
+                    }
+                };
+            });
+            threads.add(t);
+        }
+
+        // force expiration of client
+        KubernetesClientProvider.invalidate(cloud.getDisplayName());
+        cloud.connect();
+
+        // this should not close the connection because we have execs still pending
+        boolean expireClients = KubernetesClientProvider.closeExpiredClients();
+        assertFalse(expireClients);
+
+        threads.stream().forEach(t -> t.start());
+        threads.stream().forEach(t -> {
+            try {
+                System.out.println("Waiting for " + t.getName());
+                t.join();
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+        });
+        System.out.println("Connection count: " + httpClient.connectionPool().connectionCount() + " - "
+                + httpClient.connectionPool().idleConnectionCount());
+        assertEquals("Errors in threads", 0, errors.get());
+    }
+
+    @Test
+    @Issue("JENKINS-50429")
+    public void testContainerExecPerformance() throws Exception {
+        for (int i = 0; i < 10; i++) {
+            ProcReturn r = execCommand(false, "ls");
+        }
+    }
+
+    private ProcReturn execCommand(boolean quiet, String... cmd) throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        Launcher launcher = decorator
+                .decorate(new DummyLauncher(new StreamTaskListener(new TeeOutputStream(out, System.out))), null);
+        Map<String, String> envs = new HashMap<>(100);
+        for (int i = 0; i < 50; i++) {
+            envs.put("aaaaaaaa" + i, "bbbbbbbb");
+        }
+        ContainerExecProc proc = (ContainerExecProc) launcher
+                .launch(launcher.new ProcStarter().pwd("/tmp").cmds(cmd).envs(envs).quiet(quiet));
+        // wait for proc to finish (shouldn't take long)
+        for (int i = 0; proc.isAlive() && i < 200; i++) {
+            Thread.sleep(100);
+        }
+        assertFalse("proc is alive", proc.isAlive());
+        int exitCode = proc.joinWithTimeout(10, TimeUnit.SECONDS, StreamTaskListener.fromStderr());
+        return new ProcReturn(proc, exitCode, out.toString());
+    }
+
+    class ProcReturn {
+        public int exitCode;
+        public String output;
+        public ContainerExecProc proc;
+
+        ProcReturn(ContainerExecProc proc, int exitCode, String output) {
+            this.proc = proc;
+            this.exitCode = exitCode;
+            this.output = output;
+        }
+    }
+}
